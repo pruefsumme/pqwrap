@@ -1,0 +1,22 @@
+# pqwrap config
+# Reload after changes with SIGHUP, e.g.:  docker compose kill -s HUP pqwrap
+
+listen: ":443"
+
+# hybrid   X25519MLKEM768, SecP256r1MLKEM768 (default, classical clients are rejected)
+# high     SecP384r1MLKEM1024
+# compat   like hybrid, but classical clients are allowed (logged as warnings)
+# pq       MLKEM1024 only, no classical part
+# classic  X25519, P-256, for baseline measurements
+profile: hybrid
+
+# Certificate the clients see
+cert: /certs/pqwrap.crt
+key: /certs/pqwrap.key
+
+# The service behind pqwrap
+backend:
+  address: backend:443
+  tls: true                 # false = plain TCP to the backend
+  name: backend             # name in the backend certificate
+  ca: /certs/backend-ca.crt
