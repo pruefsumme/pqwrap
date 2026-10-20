@@ -1,94 +1,100 @@
-# pqwrap
+<h1 align="center">
+  <img src="docs/assets/pqwrap-readme-logo.png" alt="pqwrap" width="420">
+</h1>
 
-pqwrap protects old services against future quantum computers, without changing them.
+<p align="center">
+  Post-quantum TLS in front of legacy services, without changing the service.
+</p>
 
-## The problem
+`pqwrap` is a TLS-terminating TCP proxy that adds post-quantum key exchange in front of an existing service.
 
-Someone can record your encrypted traffic today and keep it.
-In a few years, a quantum computer may be able to break today's encryption.
-Then they can read everything they recorded.
+## Quick start
 
-New software already uses quantum-safe encryption. Old services often can't be updated.
+Requires Go 1.27 or later and a certificate and private key for the client-facing connection.
 
-## The fix
-
-Put pqwrap in front of the old service.
-
-- Users talk to pqwrap. That connection is quantum-safe.
-- pqwrap passes everything on to the old service.
-- The old service stays exactly as it is.
-
-## Run it
-
-You need Go 1.27 or newer.
+Set the certificate paths and backend address in `config/pqwrap.yaml`, then build and run:
 
 ```bash
-go build .
+go build -o pqwrap .
 ./pqwrap -config config/pqwrap.yaml
 ```
 
-Or with Docker:
+### Docker
 
 ```bash
 docker build -t pqwrap .
-docker run -p 443:443 -v ./config:/etc/pqwrap:ro -v ./certs:/certs:ro pqwrap
+docker run --rm -p 443:443 \
+  -v ./config:/etc/pqwrap:ro \
+  -v ./certs:/certs:ro \
+  pqwrap
 ```
 
-## Set it up
+Run the container on a network where the configured backend address is reachable.
 
-Everything is in one file, `config/pqwrap.yaml`:
+## Configuration
+
+All runtime settings are in `config/pqwrap.yaml`:
 
 ```yaml
-listen: ":443"              # where users connect
-profile: hybrid             # how strict pqwrap is (see below)
-cert: /certs/pqwrap.crt     # certificate users see
+listen: ":443"
+profile: hybrid
+cert: /certs/pqwrap.crt
 key: /certs/pqwrap.key
 backend:
-  address: backend:443      # the old service
-  tls: true                 # false if the old service has no encryption at all
-  name: backend             # name in the old service's certificate
+  address: backend:443
+  tls: true
+  name: backend
   ca: /certs/backend-ca.crt
 ```
 
-Changed something? Tell pqwrap to reload, no restart needed:
+`backend.tls` enables TLS to the backend and certificate verification. Set it to `false` only when the backend accepts plain TCP. If `backend.ca` is omitted, the system trust store is used.
+
+## Key exchange profiles
+
+`hybrid` is the default and recommended starting point.
+
+| Profile | Key exchange | Use |
+| --- | --- | --- |
+| `hybrid` | X25519 + ML-KEM-768 or P-256 + ML-KEM-768 | Post-quantum and classical components; classical-only clients are rejected |
+| `compat` | Hybrid groups plus X25519 and P-256 | Allows older clients; classical connections are logged as warnings |
+| `high` | P-384 + ML-KEM-1024 | Stronger hybrid profile |
+| `pq` | ML-KEM-1024 | Post-quantum only, without a classical component |
+| `classic` | X25519 or P-256 | Classical baseline measurements only |
+
+## Operations and logs
+
+Send `SIGHUP` to reload the configuration and profile without restarting the process:
 
 ```bash
-docker compose kill -s HUP pqwrap   # or: kill -HUP <pid>
+kill -HUP <pid>
+# or, with Docker Compose:
+docker compose kill -s HUP pqwrap
 ```
 
-## Profiles
+The listen address is fixed at startup. Changes to that address require a restart.
 
-| Profile | What it does |
-|---|---|
-| `hybrid` | Quantum-safe only. **Start here.** |
-| `compat` | Quantum-safe preferred, old clients still allowed (and logged as warnings) |
-| `high` | Like `hybrid`, but stronger |
-| `pq` | New encryption only, no classic part mixed in |
-| `classic` | No quantum safety. Only for comparing speed |
-
-## See what's going on
-
-pqwrap writes one line per connection:
+Each connection is reported as a JSON log entry. For example:
 
 ```json
 {"msg":"connection","client":"172.21.0.1:54190","group":"X25519MLKEM768","pq":true,"handshake_ms":3.48}
 ```
 
-- `pq: true` means this connection is quantum-safe.
-- `group` is the encryption method that was used.
-- Blocked connections show up as `"msg":"rejected"`.
+`pq: true` indicates a post-quantum key exchange. Rejected handshakes are logged with `"msg":"rejected"`.
 
-## Check it
+## Verify
+
+Run the unit tests and, with `pqwrap` listening locally, check which client groups are accepted:
 
 ```bash
 go test ./...
 ./check.sh localhost:443 certs/ca.crt backend
 ```
 
-`check.sh` tries different kinds of clients and shows which ones get in.
+`check.sh` requires OpenSSL 3.5 or later. The CA file is optional.
 
-## Good to know
+## Security model
 
-- The link from pqwrap to the old service is not quantum-safe. Keep it on a trusted network.
-- If pqwrap is down, the old service can't be reached.
-- pqwrap doesn't build its own encryption. It uses the one built into Go.
+- `pqwrap` terminates client TLS and can access the decrypted traffic; protect the host and its credentials accordingly.
+- The client-facing connection uses the selected key exchange profile. The backend connection is a separate hop and is not post-quantum protected.
+- Keep the backend hop on a trusted network. When backend TLS is enabled, `pqwrap` verifies the backend certificate; when disabled, backend traffic is plaintext.
+- `pqwrap` uses Go's TLS implementation and does not implement cryptographic algorithms itself.
