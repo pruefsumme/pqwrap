@@ -27,83 +27,83 @@ func main() {
 	path := flag.String("config", "config/pqwrap.yaml", "config file")
 	flag.Parse()
 
-	log := slog.New(slog.NewJSONHandler(os.Stdout, nil))
-	p := &proxy{log: log}
-
+	p := &proxy{log: slog.New(slog.NewJSONHandler(os.Stdout, nil))}
 	cfg, err := loadConfig(*path)
 	if err != nil {
-		log.Error("config", "error", err.Error())
+		p.log.Error("config", "error", err.Error())
 		os.Exit(1)
 	}
 	st, err := newState(cfg)
 	if err != nil {
-		log.Error("config", "error", err.Error())
+		p.log.Error("config", "error", err.Error())
 		os.Exit(1)
 	}
 	p.state.Store(st)
+	go p.reloadOnHUP(*path)
 
-	// Server mode has one fixed listener, client mode one per route
-	var l net.Listener
 	if st.client {
-		err = p.syncListeners(st)
+		err = p.runClient(st)
 	} else {
-		l, err = net.Listen("tcp", cfg.Listen)
+		err = p.runServer(st, cfg.Listen)
 	}
+	p.log.Error("stopped", "error", err.Error())
+	os.Exit(1)
+}
+
+// runServer has one fixed listener, the listen address can't change on reload
+func (p *proxy) runServer(st *state, listen string) error {
+	l, err := net.Listen("tcp", listen)
 	if err != nil {
-		log.Error("listen", "error", err.Error())
-		os.Exit(1)
+		return err
 	}
-	if st.client {
-		p.logState("started", st)
-	} else {
-		p.logState("started", st, "listen", cfg.Listen)
-	}
+	p.logState("started", st, "listen", listen)
+	return p.serve(l)
+}
 
-	// Switch profiles and routes without a restart. The mode and, in server
-	// mode, the listen address stay as they were at the start.
+// runClient has one listener per route, a reload opens and closes them
+func (p *proxy) runClient(st *state) error {
+	if err := p.syncListeners(st); err != nil {
+		return err
+	}
+	p.logState("started", st)
+	select {}
+}
+
+// reloadOnHUP switches profiles and routes without a restart.
+// The mode stays as it was at the start.
+func (p *proxy) reloadOnHUP(path string) {
 	hup := make(chan os.Signal, 1)
 	signal.Notify(hup, syscall.SIGHUP)
-	go func() {
-		for range hup {
-			var next *state
-			cfg, err := loadConfig(*path)
-			if err == nil {
-				next, err = newState(cfg)
-			}
-			if err == nil && next.client != st.client {
-				err = fmt.Errorf("changing the mode needs a restart")
-			}
-			if err != nil {
-				log.Error("reload failed, keeping old config", "error", err.Error())
-				continue
-			}
-			p.state.Store(next)
-			if next.client {
-				if err := p.syncListeners(next); err != nil {
-					log.Error("listen", "error", err.Error())
-				}
-			}
-			p.logState("reloaded", next)
+	for range hup {
+		cfg, err := loadConfig(path)
+		var next *state
+		if err == nil {
+			next, err = newState(cfg)
 		}
-	}()
-
-	if st.client {
-		select {}
-	}
-	if err := p.serve(l); err != nil {
-		log.Error("serve", "error", err.Error())
-		os.Exit(1)
+		if err == nil && next.client != p.state.Load().client {
+			err = fmt.Errorf("changing the mode needs a restart")
+		}
+		if err != nil {
+			p.log.Error("reload failed, keeping old config", "error", err.Error())
+			continue
+		}
+		p.state.Store(next)
+		if next.client {
+			if err := p.syncListeners(next); err != nil {
+				p.log.Error("listen", "error", err.Error())
+			}
+		}
+		p.logState("reloaded", next)
 	}
 }
 
 func (p *proxy) logState(msg string, st *state, extra ...any) {
-	attrs := []any{"profile", st.profile, "groups", groupNames(st.groups)}
+	var attrs []any
 	if st.client {
-		attrs = append([]any{"mode", "client"}, append(attrs, "routes", routeList(st))...)
+		attrs = []any{"mode", "client", "profile", st.profile, "groups", groupNames(st.groups), "routes", routeList(st)}
 	} else {
-		attrs = append([]any{"mode", "server"}, append(attrs,
-			"backend", st.backend.Address,
-			"backend_tls", st.backendTLS != nil)...)
+		attrs = []any{"mode", "server", "profile", st.profile, "groups", groupNames(st.groups),
+			"backend", st.backend.Address, "backend_tls", st.backendTLS != nil}
 	}
 	attrs = append(attrs, extra...)
 	if st.hint != "" {

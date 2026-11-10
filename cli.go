@@ -45,7 +45,8 @@ func clientCmd(args []string) int {
 	viaName := fs.String("via-name", "", "name in its certificate, default: host of --via")
 	ca := fs.String("ca", "", "CA to verify it, default: system trust store")
 
-	// The positional argument comes first, flags after it
+	// Go's flag package stops at the first argument that isn't a flag, so the
+	// name in "add <name:port> --via ..." is taken off before parsing
 	rest := args[1:]
 	var arg string
 	if len(rest) > 0 && !strings.HasPrefix(rest[0], "-") {
@@ -93,23 +94,14 @@ func addRoute(path, target string, remote Remote) error {
 	if cfg.Mode != "client" {
 		return fmt.Errorf("%s is not in mode client", path)
 	}
-	used := map[string]bool{}
 	for _, r := range cfg.Routes {
 		if r.Name == host {
 			return fmt.Errorf("%s is already protected (listen %s)", host, r.Listen)
 		}
-		ip, _, _ := net.SplitHostPort(r.Listen)
-		used[ip] = true
 	}
-	ip := ""
-	for n := 2; n < 255; n++ {
-		if candidate := fmt.Sprintf("127.0.0.%d", n); !used[candidate] {
-			ip = candidate
-			break
-		}
-	}
-	if ip == "" {
-		return errors.New("no free loopback address left")
+	ip, err := freeLoopback(cfg.Routes)
+	if err != nil {
+		return err
 	}
 
 	r := Route{Name: host, Listen: net.JoinHostPort(ip, port), Remote: remote}
@@ -172,6 +164,22 @@ func listRoutes(path string) error {
 	return w.Flush()
 }
 
+// freeLoopback picks the first loopback address from 127.0.0.2 on that no
+// route uses yet, so every service can keep its usual port.
+func freeLoopback(routes []Route) (string, error) {
+	used := map[string]bool{}
+	for _, r := range routes {
+		ip, _, _ := net.SplitHostPort(r.Listen)
+		used[ip] = true
+	}
+	for n := 2; n < 255; n++ {
+		if ip := fmt.Sprintf("127.0.0.%d", n); !used[ip] {
+			return ip, nil
+		}
+	}
+	return "", errors.New("no free loopback address left")
+}
+
 // editRoutes changes the routes list in the config file. It goes through the
 // YAML node tree, so comments and the other settings stay as they are.
 func editRoutes(path string, edit func(seq *yaml.Node) error) error {
@@ -190,23 +198,7 @@ func editRoutes(path string, edit func(seq *yaml.Node) error) error {
 	if doc.Kind != yaml.DocumentNode || len(doc.Content) == 0 || doc.Content[0].Kind != yaml.MappingNode {
 		return fmt.Errorf("%s: not a YAML mapping", path)
 	}
-	root := doc.Content[0]
-
-	var seq *yaml.Node
-	for i := 0; i+1 < len(root.Content); i += 2 {
-		if root.Content[i].Value == "routes" {
-			seq = root.Content[i+1]
-		}
-	}
-	if seq == nil {
-		seq = &yaml.Node{}
-		root.Content = append(root.Content, &yaml.Node{Kind: yaml.ScalarNode, Value: "routes"}, seq)
-	}
-	if seq.Kind != yaml.SequenceNode {
-		// "routes:" without entries comes in as null
-		*seq = yaml.Node{Kind: yaml.SequenceNode, Tag: "!!seq", HeadComment: seq.HeadComment, LineComment: seq.LineComment}
-	}
-	if err := edit(seq); err != nil {
+	if err := edit(routesNode(doc.Content[0])); err != nil {
 		return err
 	}
 
@@ -228,6 +220,25 @@ func editRoutes(path string, edit func(seq *yaml.Node) error) error {
 		return fmt.Errorf("edited config is invalid: %w", err)
 	}
 	return os.Rename(tmp, path)
+}
+
+// routesNode returns the "routes" list of the top-level mapping and adds an
+// empty one if there is none yet.
+func routesNode(root *yaml.Node) *yaml.Node {
+	for i := 0; i+1 < len(root.Content); i += 2 {
+		if root.Content[i].Value != "routes" {
+			continue
+		}
+		seq := root.Content[i+1]
+		if seq.Kind != yaml.SequenceNode {
+			// "routes:" without entries comes in as null
+			*seq = yaml.Node{Kind: yaml.SequenceNode, Tag: "!!seq", HeadComment: seq.HeadComment, LineComment: seq.LineComment}
+		}
+		return seq
+	}
+	seq := &yaml.Node{Kind: yaml.SequenceNode, Tag: "!!seq"}
+	root.Content = append(root.Content, &yaml.Node{Kind: yaml.ScalarNode, Value: "routes"}, seq)
+	return seq
 }
 
 // setHosts maps name to ip in /etc/hosts, or removes the mapping when ip is

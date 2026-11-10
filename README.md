@@ -73,12 +73,13 @@ Next to the client:
 
 ```yaml
 mode: client
-listen: "127.0.0.1:443"
 profile: hybrid
-backend:
-  address: gateway.example:443   # the pqwrap in server mode
-  name: gateway.example
-  ca: /certs/ca.crt
+routes:
+  - name: legacy.example          # the name the legacy client uses
+    listen: 127.0.0.1:443
+    remote:
+      address: gateway.example:443   # the pqwrap in server mode
+      ca: /certs/ca.crt              # name: defaults to the host of address
 ```
 
 Next to the server, a normal `pqwrap` with `backend.tls: false` passes the bytes on as they are:

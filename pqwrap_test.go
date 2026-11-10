@@ -158,8 +158,7 @@ func TestTunnel(t *testing.T) {
 	pki := newTestPKI(t)
 	legacy := echoServer(t, pki.serverConfig("legacy"))
 	exit, exitLogs := startProxy(t, pki, "hybrid", Backend{Address: legacy, TLS: false})
-	entry, entryLogs := startConfig(t, Config{Mode: "client", Profile: "hybrid",
-		Backend: Backend{Address: exit, TLS: true, Name: "backend", CA: pki.caFile}})
+	entry, entryLogs := startTunnel(t, "hybrid", Remote{Address: exit, Name: "backend", CA: pki.caFile})
 
 	cfg := pki.clientConfig([]tls.CurveID{tls.X25519})
 	cfg.ServerName = "legacy" // pqwrap only has a certificate for "backend"
@@ -189,8 +188,7 @@ func TestTunnel(t *testing.T) {
 func TestTunnelProfileMismatch(t *testing.T) {
 	pki := newTestPKI(t)
 	exit, _ := startProxy(t, pki, "hybrid", Backend{Address: echoServer(t, nil), TLS: false})
-	entry, logs := startConfig(t, Config{Mode: "client", Profile: "classic",
-		Backend: Backend{Address: exit, TLS: true, Name: "backend", CA: pki.caFile}})
+	entry, logs := startTunnel(t, "classic", Remote{Address: exit, Name: "backend", CA: pki.caFile})
 
 	conn, err := net.Dial("tcp", entry)
 	if err != nil {
@@ -200,9 +198,10 @@ func TestTunnelProfileMismatch(t *testing.T) {
 	logs.waitFor(t, `"msg":"remote rejected"`)
 }
 
-func TestTunnelNeedsTLS(t *testing.T) {
-	if _, err := newState(Config{Mode: "client", Profile: "hybrid", Backend: Backend{Address: "x:443"}}); err == nil {
-		t.Fatal("client mode without backend TLS was accepted")
+// Client mode is configured with routes only, a backend there is a mistake
+func TestClientModeWithBackend(t *testing.T) {
+	if _, err := newState(Config{Mode: "client", Profile: "hybrid", Backend: Backend{Address: "x:443", TLS: true}}); err == nil {
+		t.Fatal("client mode with a backend was accepted")
 	}
 }
 
@@ -213,8 +212,7 @@ func TestTunnelSubstitutedCert(t *testing.T) {
 	attacker := newTestPKI(t) // valid certificate for "backend", but from another CA
 	legacy := echoServer(t, pki.serverConfig("legacy"))
 	fake, fakeLogs := startProxy(t, attacker, "hybrid", Backend{Address: legacy, TLS: false})
-	entry, logs := startConfig(t, Config{Mode: "client", Profile: "hybrid",
-		Backend: Backend{Address: fake, TLS: true, Name: "backend", CA: pki.caFile}})
+	entry, logs := startTunnel(t, "hybrid", Remote{Address: fake, Name: "backend", CA: pki.caFile})
 
 	cfg := pki.clientConfig([]tls.CurveID{tls.X25519})
 	cfg.InsecureSkipVerify = true // like an ESP32 with setInsecure()
@@ -363,12 +361,6 @@ func startProxy(t *testing.T, pki *testPKI, profile string, b Backend) (string, 
 
 func startConfig(t *testing.T, cfg Config) (string, *logBuffer) {
 	t.Helper()
-	if cfg.Mode == "client" {
-		// The single tunnel without routes, on a free port
-		cfg.Listen = "127.0.0.1:0"
-		p, logs := startClient(t, cfg)
-		return p.addr(t, cfg.Listen), logs
-	}
 	st, err := newState(cfg)
 	if err != nil {
 		t.Fatal(err)
@@ -384,6 +376,15 @@ func startConfig(t *testing.T, cfg Config) (string, *logBuffer) {
 	t.Cleanup(func() { l.Close() })
 	go p.serve(l)
 	return l.Addr().String(), logs
+}
+
+// startTunnel runs a tunnel entry with one route on a free port
+func startTunnel(t *testing.T, profile string, remote Remote) (string, *logBuffer) {
+	t.Helper()
+	listen := "127.0.0.1:0"
+	p, logs := startClient(t, Config{Mode: "client", Profile: profile,
+		Routes: []Route{{Name: "test", Listen: listen, Remote: remote}}})
+	return p.addr(t, listen), logs
 }
 
 // startClient runs a pqwrap in client mode with a listener per route
