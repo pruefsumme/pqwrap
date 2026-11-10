@@ -33,6 +33,10 @@ func (p *proxy) serve(l net.Listener) error {
 func (p *proxy) handle(c net.Conn) {
 	defer c.Close()
 	st := p.state.Load()
+	if st.client {
+		p.tunnel(c, st)
+		return
+	}
 	start := time.Now()
 
 	// GetConfigForClient is only used to record which groups the client offers
@@ -80,7 +84,8 @@ func (p *proxy) handle(c net.Conn) {
 	if bc, ok := backend.(*tls.Conn); ok {
 		attrs = append(attrs, "backend_group", groupName(bc.ConnectionState().CurveID))
 	} else {
-		attrs = append(attrs, "backend_group", "plaintext")
+		// Bytes are passed on as they are: plaintext, or the client's own TLS in a tunnel
+		attrs = append(attrs, "backend_group", "none")
 	}
 
 	in, out := pipe(tc, backend)

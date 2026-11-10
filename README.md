@@ -61,6 +61,41 @@ backend:
 | `pq` | ML-KEM-1024 | Post-quantum only, without a classical component |
 | `classic` | X25519 or P-256 | Classical baseline measurements only |
 
+## Tunnel mode
+
+For clients that can't do post-quantum TLS either, two `pqwrap` instances form a tunnel. The client's own TLS passes through unchanged, so `pqwrap` never sees the plaintext and the server keeps its certificate:
+
+```
+legacy client ──TLS──▶ pqwrap (client) ══PQ-TLS══▶ pqwrap (server) ──TLS──▶ legacy server
+```
+
+Next to the client:
+
+```yaml
+mode: client
+listen: "127.0.0.1:443"
+profile: hybrid
+backend:
+  address: gateway.example:443   # the pqwrap in server mode
+  name: gateway.example
+  ca: /certs/ca.crt
+```
+
+Next to the server, a normal `pqwrap` with `backend.tls: false` passes the bytes on as they are:
+
+```yaml
+mode: server
+listen: ":443"
+profile: hybrid
+cert: /certs/gateway.crt
+key: /certs/gateway.key
+backend:
+  address: legacy:443
+  tls: false
+```
+
+The legacy client then connects to the tunnel entry instead of the server, e.g. via DNS or `/etc/hosts`. The tunnel carries any TCP protocol, not only TLS.
+
 ## Operations and logs
 
 Send `SIGHUP` to reload the configuration and profile without restarting the process:
@@ -79,7 +114,7 @@ Each connection is reported as a JSON log entry. For example:
 {"msg":"connection","client":"172.21.0.1:54190","group":"X25519MLKEM768","pq":true,"handshake_ms":3.48}
 ```
 
-`pq: true` indicates a post-quantum key exchange. Rejected handshakes are logged with `"msg":"rejected"`.
+`pq: true` indicates a post-quantum key exchange. Rejected handshakes are logged with `"msg":"rejected"`. `"backend_group":"none"` means the bytes are passed to the backend as they are, without TLS from `pqwrap`.
 
 ## Verify
 
@@ -94,7 +129,7 @@ go test ./...
 
 ## Security model
 
-- `pqwrap` terminates client TLS and can access the decrypted traffic; protect the host and its credentials accordingly.
+- In server mode, `pqwrap` terminates client TLS and can access the decrypted traffic; protect the host and its credentials accordingly. In tunnel mode it only sees the client's own TLS. The tunnel entry verifies the exit's certificate, but the exit does not authenticate the entry: anyone who reaches the exit can use it like the backend itself.
 - The client-facing connection uses the selected key exchange profile. The backend connection is a separate hop and is not post-quantum protected.
 - Keep the backend hop on a trusted network. When backend TLS is enabled, `pqwrap` verifies the backend certificate; when disabled, backend traffic is plaintext.
 - `pqwrap` uses Go's TLS implementation and does not implement cryptographic algorithms itself.

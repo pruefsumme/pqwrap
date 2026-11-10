@@ -3,6 +3,7 @@ package main
 import (
 	"crypto/tls"
 	"crypto/x509"
+	"errors"
 	"fmt"
 	"os"
 	"slices"
@@ -74,6 +75,7 @@ func groupNames(ids []tls.CurveID) []string {
 // state is everything built from the config.
 // On SIGHUP a new state is built and swapped in.
 type state struct {
+	client     bool // tunnel entry, see tunnel.go
 	profile    string
 	hint       string
 	groups     []tls.CurveID
@@ -93,26 +95,41 @@ func newState(cfg Config) (*state, error) {
 		return nil, fmt.Errorf("unknown profile %q, available: %s", cfg.Profile, strings.Join(names, ", "))
 	}
 
-	cert, err := tls.LoadX509KeyPair(cfg.Cert, cfg.Key)
-	if err != nil {
-		return nil, fmt.Errorf("load certificate: %w", err)
-	}
-
 	s := &state{
 		profile: cfg.Profile,
 		hint:    p.hint,
 		groups:  slices.Clone(p.groups),
 		backend: cfg.Backend,
-		server: &tls.Config{
+	}
+
+	switch cfg.Mode {
+	case "", "server":
+		cert, err := tls.LoadX509KeyPair(cfg.Cert, cfg.Key)
+		if err != nil {
+			return nil, fmt.Errorf("load certificate: %w", err)
+		}
+		s.server = &tls.Config{
 			Certificates:     []tls.Certificate{cert},
 			MinVersion:       tls.VersionTLS13,
 			CurvePreferences: p.groups,
-		},
+		}
+	case "client":
+		// The backend is the pqwrap on the other end, reached through the post-quantum hop
+		if !cfg.Backend.TLS {
+			return nil, errors.New("mode client needs backend.tls: true")
+		}
+		s.client = true
+	default:
+		return nil, fmt.Errorf("unknown mode %q, available: server, client", cfg.Mode)
 	}
 
 	if cfg.Backend.TLS {
 		// The backend certificate is always verified, there is no switch to turn that off
 		s.backendTLS = &tls.Config{ServerName: cfg.Backend.Name}
+		if s.client {
+			s.backendTLS.MinVersion = tls.VersionTLS13
+			s.backendTLS.CurvePreferences = p.groups
+		}
 		if cfg.Backend.CA != "" {
 			pem, err := os.ReadFile(cfg.Backend.CA)
 			if err != nil {

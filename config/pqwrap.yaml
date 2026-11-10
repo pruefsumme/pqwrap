@@ -1,6 +1,11 @@
 # pqwrap config
 # Reload after changes with SIGHUP, e.g.:  docker compose kill -s HUP pqwrap
 
+# server  clients connect with TLS, pqwrap forwards to the backend (default)
+# client  tunnel entry: takes plain TCP and sends it through post-quantum TLS
+#         to a pqwrap in server mode (cert and key are not needed here)
+mode: server
+
 listen: ":443"
 
 # hybrid   X25519MLKEM768, SecP256r1MLKEM768 (default, classical clients are rejected)

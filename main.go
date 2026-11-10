@@ -1,6 +1,7 @@
 // pqwrap puts post-quantum TLS in front of a service that can't be changed.
 // Clients connect with TLS 1.3 and a hybrid key exchange (ML-KEM), pqwrap
-// forwards the connection to the existing backend.
+// forwards the connection to the existing backend. For clients that can't do
+// ML-KEM either, two pqwraps form a tunnel (mode: client, see tunnel.go).
 //
 //	go run . -config config/pqwrap.yaml
 //	kill -HUP <pid>   reload the config, e.g. after switching profiles
@@ -67,7 +68,12 @@ func main() {
 }
 
 func (p *proxy) logState(msg string, st *state, extra ...any) {
+	mode := "server"
+	if st.client {
+		mode = "client"
+	}
 	attrs := append([]any{
+		"mode", mode,
 		"profile", st.profile,
 		"groups", groupNames(st.groups),
 		"backend", st.backend.Address,

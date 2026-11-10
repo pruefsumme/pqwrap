@@ -11,6 +11,7 @@ import (
 
 // Config mirrors pqwrap.yaml.
 type Config struct {
+	Mode    string  `yaml:"mode"`
 	Listen  string  `yaml:"listen"`
 	Profile string  `yaml:"profile"`
 	Cert    string  `yaml:"cert"`
@@ -26,7 +27,7 @@ type Backend struct {
 }
 
 func loadConfig(path string) (Config, error) {
-	cfg := Config{Listen: ":443", Profile: "hybrid", Backend: Backend{TLS: true}}
+	cfg := Config{Mode: "server", Listen: ":443", Profile: "hybrid", Backend: Backend{TLS: true}}
 
 	data, err := os.ReadFile(path)
 	if err != nil {

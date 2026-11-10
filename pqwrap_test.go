@@ -125,7 +125,7 @@ func TestPlaintextBackend(t *testing.T) {
 	}
 	echo(t, conn)
 	conn.Close()
-	if line := logs.waitFor(t, `"msg":"connection"`); !strings.Contains(line, `"backend_group":"plaintext"`) {
+	if line := logs.waitFor(t, `"msg":"connection"`); !strings.Contains(line, `"backend_group":"none"`) {
 		t.Errorf("unexpected log line: %s", line)
 	}
 }
@@ -150,11 +150,71 @@ func TestBadBackendCert(t *testing.T) {
 	logs.waitFor(t, `"msg":"backend unreachable"`)
 }
 
+// A legacy client with TLS 1.2 and X25519 talks through the tunnel to a legacy
+// server. Its own TLS has to arrive at the server untouched, only the hop
+// between the two pqwraps uses ML-KEM.
+func TestTunnel(t *testing.T) {
+	pki := newTestPKI(t)
+	legacy := echoServer(t, pki.serverConfig("legacy"))
+	exit, exitLogs := startProxy(t, pki, "hybrid", Backend{Address: legacy, TLS: false})
+	entry, entryLogs := startConfig(t, Config{Mode: "client", Profile: "hybrid",
+		Backend: Backend{Address: exit, TLS: true, Name: "backend", CA: pki.caFile}})
+
+	cfg := pki.clientConfig([]tls.CurveID{tls.X25519})
+	cfg.ServerName = "legacy" // pqwrap only has a certificate for "backend"
+	cfg.MaxVersion = tls.VersionTLS12
+	conn, err := tls.Dial("tcp", entry, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v := conn.ConnectionState().Version; v != tls.VersionTLS12 {
+		t.Errorf("inner TLS is %s, want TLS 1.2 from the legacy server", tls.VersionName(v))
+	}
+	echo(t, conn)
+	conn.Close()
+
+	line := entryLogs.waitFor(t, `"msg":"connection"`)
+	for _, part := range []string{`"mode":"client"`, `"group":"X25519MLKEM768"`, `"pq":true`, `"bytes_in":`} {
+		if !strings.Contains(line, part) {
+			t.Errorf("%s missing in %s", part, line)
+		}
+	}
+	if line := exitLogs.waitFor(t, `"msg":"connection"`); !strings.Contains(line, `"pq":true`) {
+		t.Errorf("unexpected log line on the server side: %s", line)
+	}
+}
+
+// The client side only offers its profile's groups, a mismatch fails the tunnel
+func TestTunnelProfileMismatch(t *testing.T) {
+	pki := newTestPKI(t)
+	exit, _ := startProxy(t, pki, "hybrid", Backend{Address: echoServer(t, nil), TLS: false})
+	entry, logs := startConfig(t, Config{Mode: "client", Profile: "classic",
+		Backend: Backend{Address: exit, TLS: true, Name: "backend", CA: pki.caFile}})
+
+	conn, err := net.Dial("tcp", entry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn.Close()
+	logs.waitFor(t, `"msg":"remote rejected"`)
+}
+
+func TestTunnelNeedsTLS(t *testing.T) {
+	if _, err := newState(Config{Mode: "client", Profile: "hybrid", Backend: Backend{Address: "x:443"}}); err == nil {
+		t.Fatal("client mode without backend TLS was accepted")
+	}
+}
+
 // --- helpers ---
 
 func startProxy(t *testing.T, pki *testPKI, profile string, b Backend) (string, *logBuffer) {
 	t.Helper()
-	st, err := newState(Config{Profile: profile, Cert: pki.certFile, Key: pki.keyFile, Backend: b})
+	return startConfig(t, Config{Profile: profile, Cert: pki.certFile, Key: pki.keyFile, Backend: b})
+}
+
+func startConfig(t *testing.T, cfg Config) (string, *logBuffer) {
+	t.Helper()
+	st, err := newState(cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
