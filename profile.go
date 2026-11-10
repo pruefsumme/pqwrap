@@ -5,6 +5,7 @@ import (
 	"crypto/x509"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"slices"
 	"sort"
@@ -81,7 +82,16 @@ type state struct {
 	groups     []tls.CurveID
 	server     *tls.Config
 	backend    Backend
-	backendTLS *tls.Config // nil = plain TCP to the backend
+	backendTLS *tls.Config       // nil = plain TCP to the backend
+	routes     map[string]*route // client mode, by listen address
+}
+
+// route is a Route ready to use, see tunnel.go
+type route struct {
+	name   string
+	listen string
+	remote string
+	tls    *tls.Config
 }
 
 func newState(cfg Config) (*state, error) {
@@ -104,6 +114,9 @@ func newState(cfg Config) (*state, error) {
 
 	switch cfg.Mode {
 	case "", "server":
+		if len(cfg.Routes) > 0 {
+			return nil, errors.New("routes are only used in mode client")
+		}
 		cert, err := tls.LoadX509KeyPair(cfg.Cert, cfg.Key)
 		if err != nil {
 			return nil, fmt.Errorf("load certificate: %w", err)
@@ -114,33 +127,79 @@ func newState(cfg Config) (*state, error) {
 			CurvePreferences: p.groups,
 		}
 	case "client":
-		// The backend is the pqwrap on the other end, reached through the post-quantum hop
-		if !cfg.Backend.TLS {
-			return nil, errors.New("mode client needs backend.tls: true")
-		}
 		s.client = true
+		routes := cfg.Routes
+		if len(routes) == 0 && cfg.Backend.Address != "" {
+			// A single tunnel from listen and backend, as before there were routes
+			if !cfg.Backend.TLS {
+				return nil, errors.New("mode client needs backend.tls: true")
+			}
+			b := cfg.Backend
+			routes = []Route{{Listen: cfg.Listen, Remote: Remote{Address: b.Address, Name: b.Name, CA: b.CA}}}
+		}
+		s.routes = make(map[string]*route, len(routes))
+		for _, r := range routes {
+			rt, err := newRoute(r, p.groups)
+			if err != nil {
+				return nil, err
+			}
+			if _, dup := s.routes[rt.listen]; dup {
+				return nil, fmt.Errorf("two routes listen on %s", rt.listen)
+			}
+			s.routes[rt.listen] = rt
+		}
+		return s, nil
 	default:
 		return nil, fmt.Errorf("unknown mode %q, available: server, client", cfg.Mode)
 	}
 
 	if cfg.Backend.TLS {
-		// The backend certificate is always verified, there is no switch to turn that off
-		s.backendTLS = &tls.Config{ServerName: cfg.Backend.Name}
-		if s.client {
-			s.backendTLS.MinVersion = tls.VersionTLS13
-			s.backendTLS.CurvePreferences = p.groups
-		}
-		if cfg.Backend.CA != "" {
-			pem, err := os.ReadFile(cfg.Backend.CA)
-			if err != nil {
-				return nil, fmt.Errorf("load backend CA: %w", err)
-			}
-			pool := x509.NewCertPool()
-			if !pool.AppendCertsFromPEM(pem) {
-				return nil, fmt.Errorf("no certificates in %s", cfg.Backend.CA)
-			}
-			s.backendTLS.RootCAs = pool
+		var err error
+		s.backendTLS, err = verifyingConfig(cfg.Backend.Name, cfg.Backend.CA)
+		if err != nil {
+			return nil, err
 		}
 	}
 	return s, nil
+}
+
+func newRoute(r Route, groups []tls.CurveID) (*route, error) {
+	if r.Listen == "" || r.Remote.Address == "" {
+		return nil, fmt.Errorf("route %q: listen and remote.address are required", r.Name)
+	}
+	name := r.Remote.Name
+	if name == "" {
+		host, _, err := net.SplitHostPort(r.Remote.Address)
+		if err != nil {
+			return nil, fmt.Errorf("route %q: %w", r.Name, err)
+		}
+		name = host
+	}
+	cfg, err := verifyingConfig(name, r.Remote.CA)
+	if err != nil {
+		return nil, fmt.Errorf("route %q: %w", r.Name, err)
+	}
+	// The hop to the other pqwrap is the post-quantum one, so it gets the profile's groups
+	cfg.MinVersion = tls.VersionTLS13
+	cfg.CurvePreferences = groups
+	return &route{name: r.Name, listen: r.Listen, remote: r.Remote.Address, tls: cfg}, nil
+}
+
+// verifyingConfig is the TLS config for connecting to name. The certificate
+// is always verified, there is no switch to turn that off.
+func verifyingConfig(name, caFile string) (*tls.Config, error) {
+	cfg := &tls.Config{ServerName: name}
+	if caFile == "" {
+		return cfg, nil
+	}
+	pem, err := os.ReadFile(caFile)
+	if err != nil {
+		return nil, fmt.Errorf("load CA: %w", err)
+	}
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(pem) {
+		return nil, fmt.Errorf("no certificates in %s", caFile)
+	}
+	cfg.RootCAs = pool
+	return cfg, nil
 }

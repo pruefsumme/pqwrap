@@ -96,6 +96,33 @@ backend:
 
 The legacy client then connects to the tunnel entry instead of the server, e.g. via DNS or `/etc/hosts`. The tunnel carries any TCP protocol, not only TLS.
 
+### Several services on one machine
+
+One `pqwrap` in client mode can protect several services, one route each. The `client` subcommands add a route to the config and point the service's name at a free loopback address in `/etc/hosts`, so apps keep using the usual name:
+
+```bash
+sudo pqwrap client add barkasse.intern:443 --via gateway.example:8443 --ca /certs/ca.crt -config config/pqwrap.yaml
+sudo pqwrap client add mail.intern:993     --via gateway.example:8993 --ca /certs/ca.crt -config config/pqwrap.yaml
+pqwrap client list -config config/pqwrap.yaml
+sudo pqwrap client remove mail.intern -config config/pqwrap.yaml
+kill -HUP <pid>   # the running pqwrap opens and closes the listeners
+```
+
+`sudo` is only needed for `/etc/hosts`; without it, `add` prints the line to add by hand. The result in the config:
+
+```yaml
+mode: client
+profile: hybrid
+routes:
+  - name: barkasse.intern
+    listen: 127.0.0.2:443
+    remote:
+      address: gateway.example:8443   # a pqwrap in server mode in front of barkasse
+      ca: /certs/ca.crt               # name: defaults to the host of address
+```
+
+Each route needs its own exit, because a `pqwrap` in server mode forwards to exactly one backend. Apps that connect to a fixed IP address instead of a name are not redirected this way.
+
 ## Operations and logs
 
 Send `SIGHUP` to reload the configuration and profile without restarting the process:
@@ -106,7 +133,7 @@ kill -HUP <pid>
 docker compose kill -s HUP pqwrap
 ```
 
-The listen address is fixed at startup. Changes to that address require a restart.
+In server mode the listen address is fixed at startup and changes to it require a restart. In client mode a reload opens and closes route listeners as needed. Switching between server and client mode always needs a restart.
 
 Each connection is reported as a JSON log entry. For example:
 
@@ -130,6 +157,7 @@ go test ./...
 ## Security model
 
 - In server mode, `pqwrap` terminates client TLS and can access the decrypted traffic; protect the host and its credentials accordingly. In tunnel mode it only sees the client's own TLS. The tunnel entry verifies the exit's certificate, but the exit does not authenticate the entry: anyone who reaches the exit can use it like the backend itself.
+- In tunnel mode only the hop between the two `pqwrap` instances is post-quantum protected; the hops from the app to the entry and from the exit to the server keep the app's own, usually classical, TLS. Against Harvest Now, Decrypt Later this works only if those hops can't be recorded: run the entry on the same host as the app (loopback) and the exit on or next to the server. A route that doesn't listen on loopback is logged as a warning.
 - The client-facing connection uses the selected key exchange profile. The backend connection is a separate hop and is not post-quantum protected.
 - Keep the backend hop on a trusted network. When backend TLS is enabled, `pqwrap` verifies the backend certificate; when disabled, backend traffic is plaintext.
 - `pqwrap` uses Go's TLS implementation and does not implement cryptographic algorithms itself.

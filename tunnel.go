@@ -16,18 +16,22 @@ import (
 // sends it through post-quantum TLS. The server side is a normal pqwrap with
 // backend.tls: false, it unwraps and passes the bytes on. The inner TLS stays
 // between client and server, pqwrap never sees the plaintext.
+//
+// One client-side pqwrap can protect several services, one route each:
+// a local address the apps connect to and the pqwrap that leads to the service.
 
 // tunnel handles one connection on the client side.
-func (p *proxy) tunnel(c net.Conn, st *state) {
+func (p *proxy) tunnel(c net.Conn, st *state, r *route) {
 	attrs := []any{
 		"mode", "client",
+		"route", r.name,
 		"client", c.RemoteAddr().String(),
 		"profile", st.profile,
-		"remote", st.backend.Address,
+		"remote", r.remote,
 	}
 
 	// Dial and handshake separately, so handshake_ms is comparable to the server side
-	raw, err := (&net.Dialer{Timeout: 5 * time.Second}).Dial("tcp", st.backend.Address)
+	raw, err := (&net.Dialer{Timeout: 5 * time.Second}).Dial("tcp", r.remote)
 	if err != nil {
 		p.log.Error("remote unreachable", append(attrs, "error", err.Error())...)
 		return
@@ -35,7 +39,7 @@ func (p *proxy) tunnel(c net.Conn, st *state) {
 	defer raw.Close()
 
 	start := time.Now()
-	remote := tls.Client(raw, st.backendTLS)
+	remote := tls.Client(raw, r.tls)
 	ctx, cancel := context.WithTimeout(context.Background(), handshakeTimeout)
 	err = remote.HandshakeContext(ctx)
 	cancel()

@@ -3,7 +3,8 @@
 
 # server  clients connect with TLS, pqwrap forwards to the backend (default)
 # client  tunnel entry: takes plain TCP and sends it through post-quantum TLS
-#         to a pqwrap in server mode (cert and key are not needed here)
+#         to a pqwrap in server mode (cert and key are not needed here).
+#         Several services: a "routes:" list, managed with `pqwrap client add`
 mode: server
 
 listen: ":443"

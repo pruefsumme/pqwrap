@@ -3,10 +3,12 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"net"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -16,6 +18,9 @@ const handshakeTimeout = 10 * time.Second
 type proxy struct {
 	state atomic.Pointer[state]
 	log   *slog.Logger
+
+	mu        sync.Mutex
+	listeners map[string]net.Listener // client mode, by route listen address
 }
 
 func (p *proxy) serve(l net.Listener) error {
@@ -28,15 +33,75 @@ func (p *proxy) serve(l net.Listener) error {
 	}
 }
 
+// syncListeners opens a listener for each new route and closes the ones whose
+// route is gone, so routes can be added and removed with a reload.
+func (p *proxy) syncListeners(st *state) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.listeners == nil {
+		p.listeners = make(map[string]net.Listener)
+	}
+	var errs []error
+	for addr, r := range st.routes {
+		if _, ok := p.listeners[addr]; ok {
+			continue
+		}
+		l, err := net.Listen("tcp", addr)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("route %q: %w", r.name, err))
+			continue
+		}
+		if !onLoopback(addr) {
+			p.log.Warn("route not on loopback", "route", r.name, "listen", addr,
+				"warning", "the hop from the app to pqwrap stays classical, run pqwrap on the same host as the app")
+		}
+		p.listeners[addr] = l
+		go p.serveRoute(l, addr)
+	}
+	for addr, l := range p.listeners {
+		if _, ok := st.routes[addr]; !ok {
+			l.Close()
+			delete(p.listeners, addr)
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// serveRoute accepts connections for one route in client mode. The route is
+// looked up for every connection, so a reload changes it for new connections.
+func (p *proxy) serveRoute(l net.Listener, addr string) {
+	for {
+		c, err := l.Accept()
+		if err != nil {
+			return
+		}
+		go func() {
+			defer c.Close()
+			st := p.state.Load()
+			if r := st.routes[addr]; r != nil {
+				p.tunnel(c, st, r)
+			}
+		}()
+	}
+}
+
+func onLoopback(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return false
+	}
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
 // handle takes care of one connection: terminate TLS from the client,
 // connect to the backend, copy data both ways and log one line at the end.
 func (p *proxy) handle(c net.Conn) {
 	defer c.Close()
 	st := p.state.Load()
-	if st.client {
-		p.tunnel(c, st)
-		return
-	}
 	start := time.Now()
 
 	// GetConfigForClient is only used to record which groups the client offers
