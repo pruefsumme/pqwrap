@@ -92,6 +92,7 @@ type route struct {
 	listen string
 	remote string
 	tls    *tls.Config
+	ownCA  bool // the exit is checked against remote.ca, not the system trust store
 }
 
 func newState(cfg Config) (*state, error) {
@@ -182,7 +183,7 @@ func newRoute(r Route, groups []tls.CurveID) (*route, error) {
 	// The hop to the other pqwrap is the post-quantum one, so it gets the profile's groups
 	cfg.MinVersion = tls.VersionTLS13
 	cfg.CurvePreferences = groups
-	return &route{name: r.Name, listen: r.Listen, remote: r.Remote.Address, tls: cfg}, nil
+	return &route{name: r.Name, listen: r.Listen, remote: r.Remote.Address, tls: cfg, ownCA: r.Remote.CA != ""}, nil
 }
 
 // verifyingConfig is the TLS config for connecting to name. The certificate

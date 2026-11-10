@@ -206,6 +206,36 @@ func TestTunnelNeedsTLS(t *testing.T) {
 	}
 }
 
+// Someone on the way to the exit presents a certificate of their own: the
+// entry must refuse it, even though the legacy client itself checks nothing
+func TestTunnelSubstitutedCert(t *testing.T) {
+	pki := newTestPKI(t)
+	attacker := newTestPKI(t) // valid certificate for "backend", but from another CA
+	legacy := echoServer(t, pki.serverConfig("legacy"))
+	fake, fakeLogs := startProxy(t, attacker, "hybrid", Backend{Address: legacy, TLS: false})
+	entry, logs := startConfig(t, Config{Mode: "client", Profile: "hybrid",
+		Backend: Backend{Address: fake, TLS: true, Name: "backend", CA: pki.caFile}})
+
+	cfg := pki.clientConfig([]tls.CurveID{tls.X25519})
+	cfg.InsecureSkipVerify = true // like an ESP32 with setInsecure()
+	if conn, err := tls.Dial("tcp", entry, cfg); err == nil {
+		conn.Close()
+		t.Fatal("tunnel accepted a substituted certificate")
+	}
+	logs.waitFor(t, `"msg":"remote rejected"`)
+	fakeLogs.mu.Lock()
+	defer fakeLogs.mu.Unlock()
+	if strings.Contains(fakeLogs.buf.String(), `"msg":"connection"`) {
+		t.Error("data reached the fake exit")
+	}
+}
+
+func TestRouteWithoutOwnCA(t *testing.T) {
+	_, logs := startClient(t, Config{Mode: "client", Profile: "hybrid", Routes: []Route{{
+		Name: "public", Listen: "127.0.0.1:0", Remote: Remote{Address: "gw:443"}}}})
+	logs.waitFor(t, `"msg":"route without own CA"`)
+}
+
 // One client-side pqwrap protects two services, each through its own exit
 func TestRoutes(t *testing.T) {
 	pki := newTestPKI(t)

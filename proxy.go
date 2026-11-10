@@ -55,6 +55,11 @@ func (p *proxy) syncListeners(st *state) error {
 			p.log.Warn("route not on loopback", "route", r.name, "listen", addr,
 				"warning", "the hop from the app to pqwrap stays classical, run pqwrap on the same host as the app")
 		}
+		if !r.ownCA {
+			// The tunnel only keeps a substituted certificate out if nobody else can issue one for the exit
+			p.log.Warn("route without own CA", "route", r.name, "remote", r.remote,
+				"warning", "the exit is checked against the system trust store, any public CA could issue a certificate for it, set remote.ca")
+		}
 		p.listeners[addr] = l
 		go p.serveRoute(l, addr)
 	}
