@@ -11,13 +11,16 @@ import (
 
 // Config mirrors pqwrap.yaml.
 type Config struct {
-	Mode    string  `yaml:"mode"`
-	Listen  string  `yaml:"listen"`
-	Profile string  `yaml:"profile"`
-	Cert    string  `yaml:"cert"`
-	Key     string  `yaml:"key"`
-	Backend Backend `yaml:"backend"`
-	Routes  []Route `yaml:"routes"` // mode client: one tunnel entry per protected service
+	Mode    string `yaml:"mode"`
+	Listen  string `yaml:"listen"`
+	Profile string `yaml:"profile"`
+	Cert    string `yaml:"cert"`
+	Key     string `yaml:"key"`
+	// mode server: only clients with a certificate from this CA get through,
+	// e.g. the tunnel entries in front of a tunnel exit
+	ClientCA string  `yaml:"client_ca"`
+	Backend  Backend `yaml:"backend"`
+	Routes   []Route `yaml:"routes"` // mode client: one tunnel entry per protected service
 }
 
 type Backend struct {
@@ -41,6 +44,8 @@ type Remote struct {
 	Address string `yaml:"address"`
 	Name    string `yaml:"name,omitempty"` // name in its certificate, default: host of address
 	CA      string `yaml:"ca,omitempty"`   // CA used to verify it, default: system trust store
+	Cert    string `yaml:"cert,omitempty"` // certificate this entry shows the exit (see client_ca)
+	Key     string `yaml:"key,omitempty"`
 }
 
 func loadConfig(path string) (Config, error) {

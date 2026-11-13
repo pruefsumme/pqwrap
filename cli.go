@@ -30,7 +30,7 @@ var hostsFile = "/etc/hosts"
 const hostsMarker = "# pqwrap"
 
 const clientUsage = `usage:
-  pqwrap client add <name:port> --via <host:port> [--via-name <name>] [--ca <file>] [-config <file>]
+  pqwrap client add <name:port> --via <host:port> [--via-name <name>] [--ca <file>] [--cert <file> --key <file>] [-config <file>]
   pqwrap client list [-config <file>]
   pqwrap client remove <name> [-config <file>]`
 
@@ -44,6 +44,8 @@ func clientCmd(args []string) int {
 	via := fs.String("via", "", "address of the pqwrap in server mode")
 	viaName := fs.String("via-name", "", "name in its certificate, default: host of --via")
 	ca := fs.String("ca", "", "CA to verify it, default: system trust store")
+	cert := fs.String("cert", "", "client certificate for an exit with client_ca")
+	key := fs.String("key", "", "key of the client certificate")
 
 	// Go's flag package stops at the first argument that isn't a flag, so the
 	// name in "add <name:port> --via ..." is taken off before parsing
@@ -59,7 +61,7 @@ func clientCmd(args []string) int {
 	var err error
 	switch args[0] {
 	case "add":
-		err = addRoute(*path, arg, Remote{Address: *via, Name: *viaName, CA: *ca})
+		err = addRoute(*path, arg, Remote{Address: *via, Name: *viaName, CA: *ca, Cert: *cert, Key: *key})
 	case "remove":
 		err = removeRoute(*path, arg)
 	case "list":

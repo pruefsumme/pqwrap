@@ -66,6 +66,9 @@ func (p *proxy) handle(c net.Conn) {
 	}
 	cs := clientTLS.ConnectionState()
 	attrs = append(attrs, tlsAttrs(cs, time.Since(start))...)
+	if len(cs.PeerCertificates) > 0 {
+		attrs = append(attrs, "client_cert", cs.PeerCertificates[0].Subject.CommonName)
+	}
 
 	backend, err := p.dialBackend(st)
 	if err != nil {

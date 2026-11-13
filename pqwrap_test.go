@@ -228,6 +228,79 @@ func TestTunnelSubstitutedCert(t *testing.T) {
 	}
 }
 
+// With client_ca the exit only lets tunnel entries through that show a
+// certificate from that CA, as BSI TR-02102-2 (3.5) asks for VPN-like setups
+func TestTunnelMutualTLS(t *testing.T) {
+	pki := newTestPKI(t)
+	other := newTestPKI(t)
+	legacy := echoServer(t, pki.serverConfig("legacy"))
+	exit, exitLogs := startConfig(t, Config{Profile: "hybrid", Cert: pki.certFile, Key: pki.keyFile,
+		ClientCA: pki.caFile, Backend: Backend{Address: legacy, TLS: false}})
+
+	dial := func(t *testing.T, remote Remote) error {
+		entry, _ := startTunnel(t, "hybrid", remote)
+		cfg := pki.clientConfig([]tls.CurveID{tls.X25519})
+		cfg.ServerName = "legacy"
+		conn, err := tls.Dial("tcp", entry, cfg)
+		if err == nil {
+			defer conn.Close()
+			echo(t, conn)
+		}
+		return err
+	}
+	remote := Remote{Address: exit, Name: "backend", CA: pki.caFile}
+
+	t.Run("entry with certificate", func(t *testing.T) {
+		r := remote
+		r.Cert, r.Key = pki.clientCert(t, "entry-laptop")
+		if err := dial(t, r); err != nil {
+			t.Fatalf("tunnel with client certificate failed: %v", err)
+		}
+		if line := exitLogs.waitFor(t, `"msg":"connection"`); !strings.Contains(line, `"client_cert":"entry-laptop"`) {
+			t.Errorf("client certificate missing in log: %s", line)
+		}
+	})
+	t.Run("entry without certificate", func(t *testing.T) {
+		if err := dial(t, remote); err == nil {
+			t.Fatal("exit let an entry without certificate through")
+		}
+	})
+	t.Run("entry with certificate from another CA", func(t *testing.T) {
+		r := remote
+		r.Cert, r.Key = other.clientCert(t, "intruder")
+		if err := dial(t, r); err == nil {
+			t.Fatal("exit accepted a certificate from another CA")
+		}
+	})
+	if strings.Count(exitLogs.waitFor(t, `"msg":"rejected"`), "certificate") == 0 {
+		t.Error("rejection without certificate reason")
+	}
+}
+
+func TestOpenExitWarning(t *testing.T) {
+	pki := newTestPKI(t)
+	for _, tc := range []struct {
+		name string
+		cfg  Config
+		warn bool
+	}{
+		{"plain backend, no client_ca", Config{Backend: Backend{Address: "x:1"}}, true},
+		{"plain backend with client_ca", Config{ClientCA: pki.caFile, Backend: Backend{Address: "x:1"}}, false},
+		{"TLS backend", Config{Backend: Backend{Address: "x:1", TLS: true}}, false},
+	} {
+		tc.cfg.Profile, tc.cfg.Cert, tc.cfg.Key = "hybrid", pki.certFile, pki.keyFile
+		st, err := newState(tc.cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		logs := &logBuffer{}
+		(&proxy{log: slog.New(slog.NewJSONHandler(logs, nil))}).warnOpenExit(st)
+		if got := strings.Contains(logs.buf.String(), "no client authentication"); got != tc.warn {
+			t.Errorf("%s: warning %v, want %v", tc.name, got, tc.warn)
+		}
+	}
+}
+
 func TestRouteWithoutOwnCA(t *testing.T) {
 	_, logs := startClient(t, Config{Mode: "client", Profile: "hybrid", Routes: []Route{{
 		Name: "public", Listen: "127.0.0.1:0", Remote: Remote{Address: "gw:443"}}}})
@@ -540,6 +613,26 @@ func (p *testPKI) serverConfig(name string) *tls.Config {
 		panic(err)
 	}
 	return &tls.Config{Certificates: []tls.Certificate{{Certificate: [][]byte{der}, PrivateKey: key}}}
+}
+
+// clientCert writes a client certificate from this CA and returns the files
+func (p *testPKI) clientCert(t *testing.T, name string) (certFile, keyFile string) {
+	t.Helper()
+	key, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	tmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(time.Now().UnixNano()),
+		Subject:      pkix.Name{CommonName: name},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(time.Hour),
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, p.ca, &key.PublicKey, p.caKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	keyDER, _ := x509.MarshalPKCS8PrivateKey(key)
+	return writePEM(t, dir, name+".crt", "CERTIFICATE", der), writePEM(t, dir, name+".key", "PRIVATE KEY", keyDER)
 }
 
 func (p *testPKI) clientConfig(groups []tls.CurveID) *tls.Config {

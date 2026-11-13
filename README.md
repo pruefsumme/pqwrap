@@ -82,7 +82,7 @@ routes:
       ca: /certs/ca.crt              # name: defaults to the host of address
 ```
 
-Next to the server, a normal `pqwrap` with `backend.tls: false` passes the bytes on as they are:
+Next to the server, a normal `pqwrap` with `backend.tls: false` passes the bytes on as they are. With `client_ca` it only lets tunnel entries through that show a certificate from that CA (mutual TLS):
 
 ```yaml
 mode: server
@@ -90,10 +90,13 @@ listen: ":443"
 profile: hybrid
 cert: /certs/gateway.crt
 key: /certs/gateway.key
+client_ca: /certs/ca.crt   # entries need a client certificate from this CA
 backend:
   address: legacy:443
   tls: false
 ```
+
+The entry shows its certificate with `remote.cert` and `remote.key` in the route (or `pqwrap client add ... --cert entry.crt --key entry.key`). The exit logs the certificate's common name as `client_cert`. Without `client_ca`, an exit with a plain backend logs the warning "no client authentication".
 
 The legacy client then connects to the tunnel entry instead of the server, e.g. via DNS or `/etc/hosts`. The tunnel carries any TCP protocol, not only TLS.
 
@@ -157,7 +160,7 @@ go test ./...
 
 ## Security model
 
-- In server mode, `pqwrap` terminates client TLS and can access the decrypted traffic; protect the host and its credentials accordingly. In tunnel mode it only sees the client's own TLS. The tunnel entry verifies the exit's certificate, but the exit does not authenticate the entry: anyone who reaches the exit can use it like the backend itself.
+- In server mode, `pqwrap` terminates client TLS and can access the decrypted traffic; protect the host and its credentials accordingly. In tunnel mode it only sees the client's own TLS. The tunnel entry verifies the exit's certificate. The exit authenticates the entry only with `client_ca`; without it, anyone who reaches the exit can use it like the backend itself.
 - In tunnel mode only the hop between the two `pqwrap` instances is post-quantum protected; the hops from the app to the entry and from the exit to the server keep the app's own, usually classical, TLS. Against Harvest Now, Decrypt Later this works only if those hops can't be recorded: run the entry on the same host as the app (loopback) and the exit on or next to the server. A route that doesn't listen on loopback is logged as a warning.
 - The tunnel also keeps certificate substitution off the protected hop: `pqwrap` never replaces the client's certificate chain, and the entry always verifies the exit, so someone on the way can't slip in a certificate of their own, even for legacy clients that don't verify certificates themselves. Give each route its own CA with `remote.ca`; with the system trust store any public CA could issue a certificate for the exit, which is logged as a warning.
 - The client-facing connection uses the selected key exchange profile. The backend connection is a separate hop and is not post-quantum protected.

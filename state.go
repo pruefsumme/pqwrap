@@ -22,6 +22,7 @@ type state struct {
 
 	// mode server
 	server     *tls.Config
+	clientAuth bool // clients need a certificate from client_ca
 	backend    Backend
 	backendTLS *tls.Config // nil = plain TCP to the backend
 
@@ -36,6 +37,7 @@ type tunnelRoute struct {
 	remote string
 	tls    *tls.Config
 	ownCA  bool // the exit is checked against remote.ca, not the system trust store
+	cert   bool // the entry shows the exit a client certificate
 }
 
 func newState(cfg Config) (*state, error) {
@@ -69,6 +71,16 @@ func newState(cfg Config) (*state, error) {
 			MinVersion:       tls.VersionTLS13,
 			CurvePreferences: prof.groups,
 		}
+		if cfg.ClientCA != "" {
+			// Mutual TLS: BSI TR-02102-2 (3.5) calls for authenticating both sides in VPN-like setups
+			pool, err := loadPool(cfg.ClientCA)
+			if err != nil {
+				return nil, err
+			}
+			s.server.ClientAuth = tls.RequireAndVerifyClientCert
+			s.server.ClientCAs = pool
+			s.clientAuth = true
+		}
 		s.backend = cfg.Backend
 		if cfg.Backend.TLS {
 			s.backendTLS, err = verifyingConfig(cfg.Backend.Name, cfg.Backend.CA)
@@ -78,6 +90,9 @@ func newState(cfg Config) (*state, error) {
 		}
 
 	case "client":
+		if cfg.ClientCA != "" {
+			return nil, errors.New("client_ca is only used in mode server, routes use remote.cert and remote.key")
+		}
 		if cfg.Backend.Address != "" {
 			return nil, errors.New("mode client uses routes, backend is only for mode server")
 		}
@@ -119,7 +134,18 @@ func newRoute(r Route, groups []tls.CurveID) (*tunnelRoute, error) {
 	// The hop to the other pqwrap is the post-quantum one, so it gets the profile's groups
 	cfg.MinVersion = tls.VersionTLS13
 	cfg.CurvePreferences = groups
-	return &tunnelRoute{name: r.Name, listen: r.Listen, remote: r.Remote.Address, tls: cfg, ownCA: r.Remote.CA != ""}, nil
+	if (r.Remote.Cert == "") != (r.Remote.Key == "") {
+		return nil, fmt.Errorf("route %q: remote.cert and remote.key belong together", r.Name)
+	}
+	if r.Remote.Cert != "" {
+		cert, err := tls.LoadX509KeyPair(r.Remote.Cert, r.Remote.Key)
+		if err != nil {
+			return nil, fmt.Errorf("route %q: load client certificate: %w", r.Name, err)
+		}
+		cfg.Certificates = []tls.Certificate{cert}
+	}
+	return &tunnelRoute{name: r.Name, listen: r.Listen, remote: r.Remote.Address, tls: cfg,
+		ownCA: r.Remote.CA != "", cert: r.Remote.Cert != ""}, nil
 }
 
 // verifyingConfig is the TLS config for connecting to name. The certificate
@@ -129,6 +155,15 @@ func verifyingConfig(name, caFile string) (*tls.Config, error) {
 	if caFile == "" {
 		return cfg, nil
 	}
+	pool, err := loadPool(caFile)
+	if err != nil {
+		return nil, err
+	}
+	cfg.RootCAs = pool
+	return cfg, nil
+}
+
+func loadPool(caFile string) (*x509.CertPool, error) {
 	pem, err := os.ReadFile(caFile)
 	if err != nil {
 		return nil, fmt.Errorf("load CA: %w", err)
@@ -137,6 +172,5 @@ func verifyingConfig(name, caFile string) (*tls.Config, error) {
 	if !pool.AppendCertsFromPEM(pem) {
 		return nil, fmt.Errorf("no certificates in %s", caFile)
 	}
-	cfg.RootCAs = pool
-	return cfg, nil
+	return pool, nil
 }

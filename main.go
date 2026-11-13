@@ -57,6 +57,7 @@ func (p *proxy) runServer(st *state, listen string) error {
 		return err
 	}
 	p.logState("started", st, "listen", listen)
+	p.warnOpenExit(st)
 	return p.serve(l)
 }
 
@@ -94,6 +95,7 @@ func (p *proxy) reloadOnHUP(path string) {
 			}
 		}
 		p.logState("reloaded", next)
+		p.warnOpenExit(next)
 	}
 }
 
@@ -110,6 +112,16 @@ func (p *proxy) logState(msg string, st *state, extra ...any) {
 		p.log.Warn(msg, append(attrs, "warning", st.hint)...)
 	} else {
 		p.log.Info(msg, attrs...)
+	}
+}
+
+// warnOpenExit points out a tunnel exit that lets anyone through: with plain
+// TCP to the backend and no client certificates, whoever reaches pqwrap
+// reaches the backend.
+func (p *proxy) warnOpenExit(st *state) {
+	if !st.client && st.backendTLS == nil && !st.clientAuth {
+		p.log.Warn("no client authentication", "backend", st.backend.Address,
+			"warning", "anyone who reaches pqwrap can use the backend, set client_ca so only tunnel entries with a certificate get through")
 	}
 }
 
