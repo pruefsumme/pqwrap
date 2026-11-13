@@ -22,11 +22,11 @@ var profiles = map[string]profile{
 	},
 	"pq": {
 		groups: []tls.CurveID{tls.MLKEM1024},
-		hint:   "ML-KEM only without a classical part, not allowed by some guidelines (e.g. BSI, ANSSI)",
+		hint:   "ML-KEM only without a classical part, against the recommendation of BSI (TR-02102-1, 2.1/2.2) and ANSSI to use it hybrid",
 	},
 	"classic": {
 		groups: []tls.CurveID{tls.X25519, tls.CurveP256},
-		hint:   "no post-quantum key exchange, meant for baseline measurements only",
+		hint:   "no post-quantum key exchange, meant for baseline measurements only (X25519 is not among the groups BSI TR-02102-2 recommends)",
 	},
 }
 
