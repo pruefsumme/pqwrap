@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/netip"
 	"os"
 	"slices"
 	"sort"
@@ -27,17 +28,21 @@ type state struct {
 	backendTLS *tls.Config // nil = plain TCP to the backend
 
 	// mode client
-	routes map[string]*tunnelRoute // by listen address
+	all         []*tunnelRoute          // every route, in config order
+	routes      map[string]*tunnelRoute // by listen address
+	transparent string                  // listen address for redirected connections, "" = off
+	intercepts  map[string]*tunnelRoute // by original destination, see transparent.go
 }
 
 // tunnelRoute is a Route from the config, ready to use
 type tunnelRoute struct {
-	name   string
-	listen string
-	remote string
-	tls    *tls.Config
-	ownCA  bool // the exit is checked against remote.ca, not the system trust store
-	cert   bool // the entry shows the exit a client certificate
+	name      string
+	listen    string // "" = only reachable through the transparent listener
+	intercept string // original destination this route takes over, "" = none
+	remote    string
+	tls       *tls.Config
+	ownCA     bool // the exit is checked against remote.ca, not the system trust store
+	cert      bool // the entry shows the exit a client certificate
 }
 
 func newState(cfg Config) (*state, error) {
@@ -61,6 +66,9 @@ func newState(cfg Config) (*state, error) {
 	case "", "server":
 		if len(cfg.Routes) > 0 {
 			return nil, errors.New("routes are only used in mode client")
+		}
+		if cfg.Transparent != "" {
+			return nil, errors.New("transparent is only used in mode client")
 		}
 		cert, err := tls.LoadX509KeyPair(cfg.Cert, cfg.Key)
 		if err != nil {
@@ -98,15 +106,29 @@ func newState(cfg Config) (*state, error) {
 		}
 		s.client = true
 		s.routes = make(map[string]*tunnelRoute, len(cfg.Routes))
+		s.transparent = cfg.Transparent
+		s.intercepts = make(map[string]*tunnelRoute)
 		for _, r := range cfg.Routes {
 			rt, err := newRoute(r, prof.groups)
 			if err != nil {
 				return nil, err
 			}
-			if _, dup := s.routes[rt.listen]; dup {
-				return nil, fmt.Errorf("two routes listen on %s", rt.listen)
+			s.all = append(s.all, rt)
+			if rt.listen != "" {
+				if _, dup := s.routes[rt.listen]; dup {
+					return nil, fmt.Errorf("two routes listen on %s", rt.listen)
+				}
+				s.routes[rt.listen] = rt
 			}
-			s.routes[rt.listen] = rt
+			if rt.intercept != "" {
+				if cfg.Transparent == "" {
+					return nil, fmt.Errorf("route %q: intercept needs the transparent listener, e.g. transparent: \":9040\"", rt.name)
+				}
+				if _, dup := s.intercepts[rt.intercept]; dup {
+					return nil, fmt.Errorf("two routes intercept %s", rt.intercept)
+				}
+				s.intercepts[rt.intercept] = rt
+			}
 		}
 
 	default:
@@ -116,8 +138,20 @@ func newState(cfg Config) (*state, error) {
 }
 
 func newRoute(r Route, groups []tls.CurveID) (*tunnelRoute, error) {
-	if r.Listen == "" || r.Remote.Address == "" {
-		return nil, fmt.Errorf("route %q: listen and remote.address are required", r.Name)
+	if (r.Listen == "" && r.Intercept == "") || r.Remote.Address == "" {
+		return nil, fmt.Errorf("route %q: listen or intercept, and remote.address are required", r.Name)
+	}
+	intercept := ""
+	if r.Intercept != "" {
+		// Redirected connections are matched by the address the device dialed, so a name can't work here
+		dst, err := netip.ParseAddrPort(r.Intercept)
+		if err != nil || !dst.Addr().Is4() {
+			return nil, fmt.Errorf("route %q: intercept %q: want an IPv4 address and port, e.g. 192.168.1.20:8883", r.Name, r.Intercept)
+		}
+		if r.Intercept == r.Remote.Address {
+			return nil, fmt.Errorf("route %q: intercept and remote.address are the same, the tunnel would catch itself", r.Name)
+		}
+		intercept = dst.String()
 	}
 	name := r.Remote.Name
 	if name == "" {
@@ -144,7 +178,7 @@ func newRoute(r Route, groups []tls.CurveID) (*tunnelRoute, error) {
 		}
 		cfg.Certificates = []tls.Certificate{cert}
 	}
-	return &tunnelRoute{name: r.Name, listen: r.Listen, remote: r.Remote.Address, tls: cfg,
+	return &tunnelRoute{name: r.Name, listen: r.Listen, intercept: intercept, remote: r.Remote.Address, tls: cfg,
 		ownCA: r.Remote.CA != "", cert: r.Remote.Cert != ""}, nil
 }
 

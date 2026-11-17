@@ -18,12 +18,18 @@ import (
 // usual name without being changed:
 //
 //	pqwrap client add barkasse.intern:443 --via pqgw.example:8443 [--ca ca.crt]
+//	pqwrap client add broker --intercept 192.168.1.20:8883 --via pqgw.example:8883
 //	pqwrap client list
 //	pqwrap client remove barkasse.intern
+//	pqwrap client rules [--local]
 //
 // Every service gets its own loopback address (127.0.0.2, 127.0.0.3, ...), so
 // several services can use the same port. A running pqwrap picks up the
 // change on SIGHUP.
+//
+// With --intercept the route is for transparent mode instead (transparent.go):
+// no loopback address and no /etc/hosts line, the firewall rules printed by
+// `pqwrap client rules` bring the connections to pqwrap.
 
 var hostsFile = "/etc/hosts"
 
@@ -31,8 +37,10 @@ const hostsMarker = "# pqwrap"
 
 const clientUsage = `usage:
   pqwrap client add <name:port> --via <host:port> [--via-name <name>] [--ca <file>] [--cert <file> --key <file>] [-config <file>]
+  pqwrap client add <name> --intercept <ip:port> --via <host:port> [...]
   pqwrap client list [-config <file>]
-  pqwrap client remove <name> [-config <file>]`
+  pqwrap client remove <name> [-config <file>]
+  pqwrap client rules [--local] [-config <file>]     nftables rules for the routes with intercept`
 
 func clientCmd(args []string) int {
 	if len(args) == 0 {
@@ -46,6 +54,8 @@ func clientCmd(args []string) int {
 	ca := fs.String("ca", "", "CA to verify it, default: system trust store")
 	cert := fs.String("cert", "", "client certificate for an exit with client_ca")
 	key := fs.String("key", "", "key of the client certificate")
+	intercept := fs.String("intercept", "", "transparent mode: the address the device really dials")
+	local := fs.Bool("local", false, "rules: catch connections of apps on this machine instead of devices behind it")
 
 	// Go's flag package stops at the first argument that isn't a flag, so the
 	// name in "add <name:port> --via ..." is taken off before parsing
@@ -61,11 +71,13 @@ func clientCmd(args []string) int {
 	var err error
 	switch args[0] {
 	case "add":
-		err = addRoute(*path, arg, Remote{Address: *via, Name: *viaName, CA: *ca, Cert: *cert, Key: *key})
+		err = addRoute(*path, arg, *intercept, Remote{Address: *via, Name: *viaName, CA: *ca, Cert: *cert, Key: *key})
 	case "remove":
 		err = removeRoute(*path, arg)
 	case "list":
 		err = listRoutes(*path)
+	case "rules":
+		err = printRules(*path, *local)
 	default:
 		fmt.Fprintln(os.Stderr, clientUsage)
 		return 2
@@ -77,8 +89,11 @@ func clientCmd(args []string) int {
 	return 0
 }
 
-func addRoute(path, target string, remote Remote) error {
+func addRoute(path, target, intercept string, remote Remote) error {
 	host, port, err := net.SplitHostPort(target)
+	if intercept != "" && err != nil && target != "" {
+		host, err = target, nil // the port comes from --intercept
+	}
 	if err != nil {
 		return fmt.Errorf("%q: want name:port, e.g. barkasse.intern:443", target)
 	}
@@ -101,12 +116,16 @@ func addRoute(path, target string, remote Remote) error {
 			return fmt.Errorf("%s is already protected (listen %s)", host, r.Listen)
 		}
 	}
-	ip, err := freeLoopback(cfg.Routes)
-	if err != nil {
-		return err
+	r := Route{Name: host, Intercept: intercept, Remote: remote}
+	ip := ""
+	if intercept == "" {
+		if ip, err = freeLoopback(cfg.Routes); err != nil {
+			return err
+		}
+		r.Listen = net.JoinHostPort(ip, port)
+	} else if cfg.Transparent == "" {
+		return fmt.Errorf("%s has no transparent listener, add a line like: transparent: \":9040\"", path)
 	}
-
-	r := Route{Name: host, Listen: net.JoinHostPort(ip, port), Remote: remote}
 	err = editRoutes(path, func(seq *yaml.Node) error {
 		var item yaml.Node
 		if err := item.Encode(r); err != nil {
@@ -118,19 +137,39 @@ func addRoute(path, target string, remote Remote) error {
 	if err != nil {
 		return err
 	}
+	if intercept != "" {
+		fmt.Printf("%s (%s) now goes through %s, load the firewall rules with: pqwrap client rules | sudo nft -f -\n",
+			host, intercept, remote.Address)
+		return nil
+	}
 	fmt.Printf("%s now goes through %s (listen %s)\n", host, remote.Address, r.Listen)
 	return setHosts(ip, host)
+}
+
+func printRules(path string, local bool) error {
+	cfg, err := loadConfig(path)
+	if err != nil {
+		return err
+	}
+	rules, err := nftRules(cfg, local)
+	if err != nil {
+		return err
+	}
+	fmt.Print(rules)
+	return nil
 }
 
 func removeRoute(path, name string) error {
 	if name == "" {
 		return errors.New("name is missing")
 	}
+	inHosts := true
 	err := editRoutes(path, func(seq *yaml.Node) error {
 		for i, item := range seq.Content {
 			var r Route
 			if item.Decode(&r) == nil && r.Name == name {
 				seq.Content = append(seq.Content[:i], seq.Content[i+1:]...)
+				inHosts = r.Listen != ""
 				return nil
 			}
 		}
@@ -140,6 +179,9 @@ func removeRoute(path, name string) error {
 		return err
 	}
 	fmt.Printf("%s removed\n", name)
+	if !inHosts {
+		return nil // transparent mode: nothing in /etc/hosts, the firewall rules need a reload instead
+	}
 	return setHosts("", name)
 }
 
@@ -156,6 +198,11 @@ func listRoutes(path string) error {
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
 	fmt.Fprintln(w, "NAME\tLISTEN\tVIA\tHOSTS")
 	for _, r := range cfg.Routes {
+		if r.Listen == "" {
+			// transparent mode: the firewall brings the connections, not /etc/hosts
+			fmt.Fprintf(w, "%s\tintercept %s\t%s\t-\n", r.Name, r.Intercept, r.Remote.Address)
+			continue
+		}
 		ip, _, _ := net.SplitHostPort(r.Listen)
 		status := "ok"
 		if hosts[r.Name] != ip {

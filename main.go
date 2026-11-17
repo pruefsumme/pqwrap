@@ -16,6 +16,7 @@ import (
 	"os"
 	"os/signal"
 	"sort"
+	"strings"
 	"syscall"
 )
 
@@ -103,6 +104,9 @@ func (p *proxy) logState(msg string, st *state, extra ...any) {
 	var attrs []any
 	if st.client {
 		attrs = []any{"mode", "client", "profile", st.profile, "groups", groupNames(st.groups), "routes", routeList(st)}
+		if st.transparent != "" {
+			attrs = append(attrs, "transparent", st.transparent)
+		}
 	} else {
 		attrs = []any{"mode", "server", "profile", st.profile, "groups", groupNames(st.groups),
 			"backend", st.backend.Address, "backend_tls", st.backendTLS != nil}
@@ -127,9 +131,13 @@ func (p *proxy) warnOpenExit(st *state) {
 
 // routeList shows the routes in the start and reload log lines
 func routeList(st *state) []string {
-	list := make([]string, 0, len(st.routes))
-	for _, r := range st.routes {
-		list = append(list, fmt.Sprintf("%s %s -> %s", r.name, r.listen, r.remote))
+	list := make([]string, 0, len(st.all))
+	for _, r := range st.all {
+		from := r.listen
+		if r.intercept != "" {
+			from = strings.TrimSpace(from + " intercept " + r.intercept)
+		}
+		list = append(list, fmt.Sprintf("%s %s -> %s", r.name, from, r.remote))
 	}
 	sort.Strings(list)
 	return list

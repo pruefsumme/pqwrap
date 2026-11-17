@@ -43,21 +43,34 @@ func (p *proxy) syncListeners(st *state) error {
 			p.log.Warn("route not on loopback", "route", r.name, "listen", addr,
 				"warning", "the hop from the app to pqwrap stays classical, run pqwrap on the same host as the app")
 		}
-		if !r.ownCA {
-			// The tunnel only keeps a substituted certificate out if nobody else can issue one for the exit
-			p.log.Warn("route without own CA", "route", r.name, "remote", r.remote,
-				"warning", "the exit is checked against the system trust store, any public CA could issue a certificate for it, set remote.ca")
-		}
+		p.warnWithoutOwnCA(r)
 		p.listeners[addr] = l
 		go p.serveRoute(l, addr)
 	}
+	transparent := ""
+	if st.transparent != "" {
+		transparent = transparentKey + st.transparent
+		if _, ok := p.listeners[transparent]; !ok {
+			if err := p.openTransparent(st, transparent); err != nil {
+				errs = append(errs, fmt.Errorf("transparent: %w", err))
+			}
+		}
+	}
 	for addr, l := range p.listeners {
-		if _, ok := st.routes[addr]; !ok {
+		if _, ok := st.routes[addr]; !ok && addr != transparent {
 			l.Close()
 			delete(p.listeners, addr)
 		}
 	}
 	return errors.Join(errs...)
+}
+
+// The tunnel only keeps a substituted certificate out if nobody else can issue one for the exit
+func (p *proxy) warnWithoutOwnCA(r *tunnelRoute) {
+	if !r.ownCA {
+		p.log.Warn("route without own CA", "route", r.name, "remote", r.remote,
+			"warning", "the exit is checked against the system trust store, any public CA could issue a certificate for it, set remote.ca")
+	}
 }
 
 // serveRoute accepts connections for one route. The route is looked up for
@@ -90,8 +103,9 @@ func onLoopback(addr string) bool {
 	return ip != nil && ip.IsLoopback()
 }
 
-// tunnel handles one connection on the client side.
-func (p *proxy) tunnel(c net.Conn, st *state, r *tunnelRoute) {
+// tunnel handles one connection on the client side. extra are log fields
+// from the caller, e.g. the original destination in transparent mode.
+func (p *proxy) tunnel(c net.Conn, st *state, r *tunnelRoute, extra ...any) {
 	attrs := []any{
 		"mode", "client",
 		"route", r.name,
@@ -99,6 +113,7 @@ func (p *proxy) tunnel(c net.Conn, st *state, r *tunnelRoute) {
 		"profile", st.profile,
 		"remote", r.remote,
 	}
+	attrs = append(attrs, extra...)
 
 	// Dial and handshake separately, so handshake_ms is comparable to the server side
 	raw, err := (&net.Dialer{Timeout: dialTimeout}).Dial("tcp", r.remote)

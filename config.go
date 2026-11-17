@@ -21,6 +21,9 @@ type Config struct {
 	ClientCA string  `yaml:"client_ca"`
 	Backend  Backend `yaml:"backend"`
 	Routes   []Route `yaml:"routes"` // mode client: one tunnel entry per protected service
+	// mode client: one listener for connections that a firewall rule redirects
+	// to pqwrap, for routes with intercept (see transparent.go)
+	Transparent string `yaml:"transparent"`
 }
 
 type Backend struct {
@@ -32,10 +35,12 @@ type Backend struct {
 
 // Route is one protected service in client mode: apps reach Name at Listen,
 // pqwrap carries the connection to the pqwrap in server mode at Remote.
+// A route needs Listen, Intercept or both.
 type Route struct {
-	Name   string `yaml:"name"`   // host name the apps use, see `pqwrap client add`
-	Listen string `yaml:"listen"` // local address, e.g. 127.0.0.2:443
-	Remote Remote `yaml:"remote"`
+	Name      string `yaml:"name"`                // host name the apps use, see `pqwrap client add`
+	Listen    string `yaml:"listen,omitempty"`    // local address, e.g. 127.0.0.2:443
+	Intercept string `yaml:"intercept,omitempty"` // transparent mode: the address the device really dials, e.g. 192.168.1.20:8883
+	Remote    Remote `yaml:"remote"`
 }
 
 // Remote is the pqwrap in server mode at the other end of a tunnel.
