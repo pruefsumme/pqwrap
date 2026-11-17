@@ -3,37 +3,33 @@
 </h1>
 
 <p align="center">
-  Post-quantum TLS in front of legacy services, without changing the service.
+  Post-quantum TLS for services and devices that can't be updated.
 </p>
 
-`pqwrap` is a TLS-terminating TCP proxy that adds post-quantum key exchange in front of an existing service.
+`pqwrap` is a small TCP proxy that adds a hybrid post-quantum key exchange (X25519 + ML-KEM-768) to connections whose endpoints can't do it themselves. Recorded traffic then stays unreadable even for a future quantum computer. There are three ways to use it:
 
-## Quick start
+```
+1. old server      client ══PQ-TLS══▶ pqwrap ──▶ server
+2. old client      client ──▶ pqwrap ══PQ-TLS══▶ pqwrap ──▶ server
+3. fixed device    device ──▶ gateway (firewall ▶ pqwrap) ══PQ-TLS══▶ pqwrap ──▶ server
+```
 
-Requires Go 1.27 or later and a certificate and private key for the client-facing connection.
+In 2 and 3 the client's own TLS passes through the tunnel untouched: `pqwrap` never sees the plaintext and the server keeps its certificate.
 
-Set the certificate paths and backend address in `config/pqwrap.yaml`, then build and run:
+## Install
+
+Needs Go 1.27 or later.
 
 ```bash
 go build -o pqwrap .
 ./pqwrap -config config/pqwrap.yaml
 ```
 
-### Docker
+Or with Docker: `docker build -t pqwrap .`, then mount the config at `/etc/pqwrap` and your certificates.
 
-```bash
-docker build -t pqwrap .
-docker run --rm -p 443:443 \
-  -v ./config:/etc/pqwrap:ro \
-  -v ./certs:/certs:ro \
-  pqwrap
-```
+## 1. In front of an old server
 
-Run the container on a network where the configured backend address is reachable.
-
-## Configuration
-
-All runtime settings are in `config/pqwrap.yaml`:
+Clients that already support ML-KEM (current browsers) connect to `pqwrap`, which forwards to the unchanged server.
 
 ```yaml
 listen: ":443"
@@ -42,127 +38,94 @@ cert: /certs/pqwrap.crt
 key: /certs/pqwrap.key
 backend:
   address: backend:443
-  tls: true
-  name: backend
-  ca: /certs/backend-ca.crt
+  name: backend              # name in the backend's certificate
+  ca: /certs/backend-ca.crt  # omit to use the system trust store
 ```
 
-`backend.tls` enables TLS to the backend and certificate verification. Set it to `false` only when the backend accepts plain TCP. If `backend.ca` is omitted, the system trust store is used.
+## 2. Tunnel for old clients
 
-## Key exchange profiles
+If the client can't do ML-KEM either, put one `pqwrap` next to the client (entry) and one next to the server (exit).
 
-`hybrid` is the default and recommended starting point.
-
-| Profile | Key exchange | Use |
-| --- | --- | --- |
-| `hybrid` | X25519 + ML-KEM-768 or P-256 + ML-KEM-768 | Post-quantum and classical components; classical-only clients are rejected |
-| `compat` | Hybrid groups plus X25519 and P-256 | Allows older clients; classical connections are logged as warnings |
-| `high` | P-384 + ML-KEM-1024 | Stronger hybrid profile |
-| `pq` | ML-KEM-1024 | Post-quantum only, without a classical component |
-| `classic` | X25519 or P-256 | Classical baseline measurements only |
-
-## Tunnel mode
-
-For clients that can't do post-quantum TLS either, two `pqwrap` instances form a tunnel. The client's own TLS passes through unchanged, so `pqwrap` never sees the plaintext and the server keeps its certificate:
-
-```
-legacy client ──TLS──▶ pqwrap (client) ══PQ-TLS══▶ pqwrap (server) ──TLS──▶ legacy server
-```
-
-Next to the client:
+Exit, next to the server:
 
 ```yaml
-mode: client
-profile: hybrid
-routes:
-  - name: legacy.example          # the name the legacy client uses
-    listen: 127.0.0.1:443
-    remote:
-      address: gateway.example:443   # the pqwrap in server mode
-      ca: /certs/ca.crt              # name: defaults to the host of address
-```
-
-Next to the server, a normal `pqwrap` with `backend.tls: false` passes the bytes on as they are. With `client_ca` it only lets tunnel entries through that show a certificate from that CA (mutual TLS):
-
-```yaml
-mode: server
 listen: ":443"
 profile: hybrid
-cert: /certs/gateway.crt
-key: /certs/gateway.key
-client_ca: /certs/ca.crt   # entries need a client certificate from this CA
+cert: /certs/exit.crt
+key: /certs/exit.key
+client_ca: /certs/ca.crt   # only entries with a certificate from this CA get through
 backend:
   address: legacy:443
-  tls: false
+  tls: false               # pass the client's own TLS on as it is
 ```
 
-The entry shows its certificate with `remote.cert` and `remote.key` in the route (or `pqwrap client add ... --cert entry.crt --key entry.key`). The exit logs the certificate's common name as `client_cert`. Without `client_ca`, an exit with a plain backend logs the warning "no client authentication".
-
-The legacy client then connects to the tunnel entry instead of the server, e.g. via DNS or `/etc/hosts`. The tunnel carries any TCP protocol, not only TLS.
-
-### Several services on one machine
-
-One `pqwrap` in client mode can protect several services, one route each. The `client` subcommands add a route to the config and point the service's name at a free loopback address in `/etc/hosts`, so apps keep using the usual name:
+Entry, on the same machine as the client. Start with a config that only says `mode: client`, then add one route per service:
 
 ```bash
-sudo pqwrap client add barkasse.intern:443 --via gateway.example:8443 --ca /certs/ca.crt -config config/pqwrap.yaml
-sudo pqwrap client add mail.intern:993     --via gateway.example:8993 --ca /certs/ca.crt -config config/pqwrap.yaml
-pqwrap client list -config config/pqwrap.yaml
-sudo pqwrap client remove mail.intern -config config/pqwrap.yaml
-kill -HUP <pid>   # the running pqwrap opens and closes the listeners
+sudo pqwrap client add legacy.intern:443 --via gateway.example:443 \
+    --ca ca.crt --cert entry.crt --key entry.key
+pqwrap client list
+sudo pqwrap client remove legacy.intern
 ```
 
-`sudo` is only needed for `/etc/hosts`; without it, `add` prints the line to add by hand. The result in the config:
+`add` gives the service a loopback address and points its name there in `/etc/hosts` (that is what `sudo` is for), so apps keep using the usual name. A running `pqwrap` picks up the change with `kill -HUP <pid>`.
+
+## 3. Transparent mode for devices you can't touch
+
+A sensor with fixed firmware can't be pointed at an entry. Run the entry on the gateway next to it instead and let the firewall hand the device's connections to `pqwrap`. The device keeps dialing its server as always.
 
 ```yaml
 mode: client
 profile: hybrid
+transparent: ":9040"                # one port for all redirected connections
 routes:
-  - name: barkasse.intern
-    listen: 127.0.0.2:443
+  - name: broker
+    intercept: 192.168.1.20:8883    # the address the device dials
     remote:
-      address: gateway.example:8443   # a pqwrap in server mode in front of barkasse
-      ca: /certs/ca.crt               # name: defaults to the host of address
+      address: gateway.example:8883 # the exit
+      ca: /certs/ca.crt
 ```
-
-Each route needs its own exit, because a `pqwrap` in server mode forwards to exactly one backend. Apps that connect to a fixed IP address instead of a name are not redirected this way.
-
-## Operations and logs
-
-Send `SIGHUP` to reload the configuration and profile without restarting the process:
 
 ```bash
-kill -HUP <pid>
-# or, with Docker Compose:
-docker compose kill -s HUP pqwrap
+pqwrap client rules | sudo nft -f -   # load the nftables redirect
+sudo nft delete table ip pqwrap       # remove it again
 ```
 
-In server mode the listen address is fixed at startup and changes to it require a restart. In client mode a reload opens and closes route listeners as needed. Switching between server and client mode always needs a restart.
+Linux and IPv4 only. The rules are not persistent; add them to your nftables config to keep them across reboots. Redirected connections without a matching route are closed, never passed on unprotected. `pqwrap` must run on the host itself, not behind a userspace port forwarder such as rootless Docker.
 
-Each connection is reported as a JSON log entry. For example:
+## Profiles
+
+| Profile | Allows | Use |
+| --- | --- | --- |
+| `hybrid` | X25519MLKEM768, SecP256r1MLKEM768 | Default. Classical-only clients are rejected |
+| `high` | SecP384r1MLKEM1024 | Stronger hybrid |
+| `compat` | hybrid plus X25519, P-256 | Transition: old clients get in, logged as a warning |
+| `pq` | MLKEM1024 | Comparison only, no classical part |
+| `classic` | X25519, P-256 | Baseline measurements only |
+
+Switch profiles or routes without a restart: edit the config and send `SIGHUP`.
+
+## Logs
+
+One JSON line per connection. `"pq": true` means the key exchange was quantum-safe:
 
 ```json
 {"msg":"connection","client":"172.21.0.1:54190","group":"X25519MLKEM768","pq":true,"handshake_ms":3.48}
 ```
 
-`pq: true` indicates a post-quantum key exchange. Rejected handshakes are logged with `"msg":"rejected"`. `"backend_group":"none"` means the bytes are passed to the backend as they are, without TLS from `pqwrap`.
+Rejected clients are logged with `"msg":"rejected"` and the groups they offered.
 
-## Verify
+## Limits
 
-Run the unit tests and, with `pqwrap` listening locally, check which client groups are accepted:
+- Only the hop that `pqwrap` protects is post-quantum. The hops to the old server and from the old client stay classical, so keep `pqwrap` as close to them as possible.
+- A tunnel needs an exit you run yourself. It can't protect connections to someone else's server.
+- In mode 1 `pqwrap` terminates TLS and sees the plaintext. In a tunnel it doesn't.
+- Use your own CA for the tunnel (`--ca`, `client_ca`). `pqwrap` warns at start about routes without one and about exits that let anyone in.
+- Certificates use classical signatures. `pqwrap` uses Go's `crypto/tls` and implements no cryptography itself.
+
+## Tests
 
 ```bash
 go test ./...
-./check.sh localhost:443 certs/ca.crt backend
+./check.sh localhost:443 certs/ca.crt backend   # which groups a running pqwrap accepts, needs OpenSSL 3.5
 ```
-
-`check.sh` requires OpenSSL 3.5 or later. The CA file is optional.
-
-## Security model
-
-- In server mode, `pqwrap` terminates client TLS and can access the decrypted traffic; protect the host and its credentials accordingly. In tunnel mode it only sees the client's own TLS. The tunnel entry verifies the exit's certificate. The exit authenticates the entry only with `client_ca`; without it, anyone who reaches the exit can use it like the backend itself.
-- In tunnel mode only the hop between the two `pqwrap` instances is post-quantum protected; the hops from the app to the entry and from the exit to the server keep the app's own, usually classical, TLS. Against Harvest Now, Decrypt Later this works only if those hops can't be recorded: run the entry on the same host as the app (loopback) and the exit on or next to the server. A route that doesn't listen on loopback is logged as a warning.
-- The tunnel also keeps certificate substitution off the protected hop: `pqwrap` never replaces the client's certificate chain, and the entry always verifies the exit, so someone on the way can't slip in a certificate of their own, even for legacy clients that don't verify certificates themselves. Give each route its own CA with `remote.ca`; with the system trust store any public CA could issue a certificate for the exit, which is logged as a warning.
-- The client-facing connection uses the selected key exchange profile. The backend connection is a separate hop and is not post-quantum protected.
-- Keep the backend hop on a trusted network. When backend TLS is enabled, `pqwrap` verifies the backend certificate; when disabled, backend traffic is plaintext.
-- `pqwrap` uses Go's TLS implementation and does not implement cryptographic algorithms itself.
